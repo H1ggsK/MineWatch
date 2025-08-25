@@ -1,0 +1,11 @@
+{
+  "parent": "block/cube",
+  "textures": {
+    "down": "minewatch:blocks/camera_side",
+    "up": "minewatch:blocks/camera_side",
+    "north": "minewatch:blocks/camera_front",
+    "south": "minewatch:blocks/camera_side",
+    "west": "minewatch:blocks/camera_side",
+    "east": "minewatch:blocks/camera_side"
+  }
+}

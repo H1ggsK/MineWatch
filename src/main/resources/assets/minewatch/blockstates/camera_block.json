@@ -1,0 +1,10 @@
+{
+  "variants": {
+    "facing=north": { "model": "minewatch:camera_block" },
+    "facing=south": { "model": "minewatch:camera_block", "y": 180 },
+    "facing=west":  { "model": "minewatch:camera_block", "y": 270 },
+    "facing=east":  { "model": "minewatch:camera_block", "y": 90 },
+    "facing=up":    { "model": "minewatch:camera_block", "x": -90 },
+    "facing=down":  { "model": "minewatch:camera_block", "x": 90 }
+  }
+}
