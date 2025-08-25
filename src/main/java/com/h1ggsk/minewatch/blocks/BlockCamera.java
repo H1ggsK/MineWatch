@@ -49,6 +49,8 @@ public class BlockCamera extends Block {
     // Resolution scale for screenshots: 1.0 = full size, 0.5 = half size, etc.
     // Lower this to reduce main-thread time for glReadPixels and to reduce memory/encoding time.
     private static final double RESOLUTION_SCALE = 1.0; // change to 0.5 or 0.33 for quicker captures
+    // THIS IS BROKEN, IT SCALES DOWN TO A PART OF YOUR SCREEN BASED ON THE LOWER LEFT CORNER POSITION
+    // IE RESOLUTION_SCALE = 0.5 IS THE BOTTOM LEFT QUARTER OF THE SCREEN
 
     public BlockCamera() {
         super(Material.IRON);
@@ -86,31 +88,29 @@ public class BlockCamera extends Block {
     }
 
     private static void calculateCameraRotation() {
-        Minecraft mc = Minecraft.getMinecraft();
-
         switch (cameraFacing) {
             case NORTH:
-                cameraYaw = 180f;
+                cameraYaw = 0f;  // Changed from 180f to 0f
                 cameraPitch = 0f;
                 break;
             case SOUTH:
-                cameraYaw = 0f;
+                cameraYaw = 180f;  // Changed from 0f to 180f
                 cameraPitch = 0f;
                 break;
             case WEST:
-                cameraYaw = 90f;
-                cameraPitch = 0f;
-                break;
-            case EAST:
                 cameraYaw = 270f;
                 cameraPitch = 0f;
                 break;
+            case EAST:
+                cameraYaw = 90f;
+                cameraPitch = 0f;
+                break;
             case UP:
-                cameraYaw = mc.player.rotationYaw;
+                cameraYaw = 0f;  // Fixed - don't use player yaw
                 cameraPitch = -90f;
                 break;
             case DOWN:
-                cameraYaw = mc.player.rotationYaw;
+                cameraYaw = 0f;  // Fixed - don't use player yaw
                 cameraPitch = 90f;
                 break;
         }
@@ -146,23 +146,23 @@ public class BlockCamera extends Block {
             // Create a temporary camera entity
             cameraView = new ClientViewPlayer(mc.world);
 
-            // Calculate camera position
+            // Calculate camera position - center of the block
             double camX = cameraPos.getX() + 0.5;
-            double camY = cameraPos.getY() + 0.5;
+            double camY = cameraPos.getY();
             double camZ = cameraPos.getZ() + 0.5;
 
-            // Nudge camera slightly away from the block face
-            double off = 0.3;
+            // Nudge camera slightly away from the block face in the correct direction
+            double off = 0.1;
             switch (cameraFacing) {
-                case NORTH: camZ += off; break;
-                case SOUTH: camZ -= off; break;
-                case WEST:  camX += off; break;
-                case EAST:  camX -= off; break;
-                case UP:    camY -= off; break;
-                case DOWN:  camY += off; break;
+                case NORTH: camZ -= off; break;
+                case SOUTH: camZ += off; break;
+                case WEST:  camX -= off; break;
+                case EAST:  camX += off; break;
+                case UP:    camY += off; break;
+                case DOWN:  camY -= off; break;
             }
 
-            // Position the camera (rotation will be handled by the CameraSetup event)
+            // Position the camera
             cameraView.setLocationAndAngles(camX, camY, camZ, cameraYaw, cameraPitch);
             cameraView.world = mc.world;
 
@@ -183,35 +183,31 @@ public class BlockCamera extends Block {
             // Set the camera view - this will trigger the CameraSetup event
             mc.setRenderViewEntity(cameraView);
 
-            // Force a render update to ensure the camera is properly positioned and render into the framebuffer
+            // Force a render update
             mc.entityRenderer.updateCameraAndRender(mc.getRenderPartialTicks(), System.nanoTime());
 
-            // --- MAIN THREAD: read pixels into an int[] quickly (glReadPixels is required on main thread)
-            // IMPORTANT: Ensure we're reading from our custom framebuffer, not the main one
-            framebuffer.bindFramebuffer(true); // <-- CRITICAL FIX
-
+            // Read pixels from framebuffer
+            framebuffer.bindFramebuffer(true);
             int width = framebuffer.framebufferWidth;
             int height = framebuffer.framebufferHeight;
             IntBuffer buf = BufferUtils.createIntBuffer(width * height);
             GL11.glPixelStorei(GL11.GL_PACK_ALIGNMENT, 1);
             GL11.glPixelStorei(GL11.GL_UNPACK_ALIGNMENT, 1);
-            // Read RGBA (matching standard framebuffer order)
             GL11.glReadPixels(0, 0, width, height, GL11.GL_RGBA, GL11.GL_UNSIGNED_BYTE, buf);
 
             int[] pixels = new int[width * height];
             buf.get(pixels);
 
-            // We no longer need the GL framebuffer resource: delete it now (main thread)
+            // Clean up GL resources
             framebuffer.deleteFramebuffer();
             framebuffer = null;
 
-            // Restore view entity and GUI immediately
+            // Restore view entity and GUI
             mc.setRenderViewEntity(originalViewEntity);
             mc.gameSettings.hideGUI = originalHideGUI;
             cameraView = null;
 
-            // Hand off actual encoding + disk IO to background thread.
-            // Copy the pixels array (it's already a plain int[] so it's safe to pass)
+            // Save the screenshot in background thread
             final int w = width;
             final int h = height;
             final int[] pixelsToSave = pixels;
@@ -222,29 +218,28 @@ public class BlockCamera extends Block {
 
             saveExecutor.submit(() -> {
                 try {
+                    // Convert BGRA to ARGB
                     for (int i = 0; i < pixelsToSave.length; ++i) {
                         int bgra = pixelsToSave[i];
-                        int r = (bgra >> 16) & 0xFF;  // Red
-                        int g = (bgra >> 8) & 0xFF;   // Green
-                        int b = bgra & 0xFF;           // Blue
-                        int a = (bgra >> 24) & 0xFF;   // Alpha
-
-                        // Recombine as ARGB
+                        int r = (bgra >> 16) & 0xFF;
+                        int g = (bgra >> 8) & 0xFF;
+                        int b = bgra & 0xFF;
+                        int a = (bgra >> 24) & 0xFF;
                         pixelsToSave[i] = (a << 24) | (b << 16) | (g << 8) | r;
                     }
 
-                    // Flip rows because glReadPixels origin is bottom-left
+                    // Flip image vertically
                     int[] flipped = new int[w * h];
                     for (int y = 0; y < h; ++y) {
                         System.arraycopy(pixelsToSave, (h - y - 1) * w, flipped, y * w, w);
                     }
 
-                    // Create BufferedImage and write
+                    // Save image
                     BufferedImage image = new BufferedImage(w, h, BufferedImage.TYPE_INT_ARGB);
                     image.setRGB(0, 0, w, h, flipped, 0, w);
                     ImageIO.write(image, "png", outFile);
 
-                    // Notify player on the main thread
+                    // Notify player
                     Minecraft.getMinecraft().addScheduledTask(() ->
                             Minecraft.getMinecraft().player.sendMessage(new TextComponentString("Saved security camera screenshot: " + filename))
                     );
@@ -257,7 +252,7 @@ public class BlockCamera extends Block {
             });
 
         } catch (Exception e) {
-            // If anything went wrong, try to restore things
+            // Restore on error
             try {
                 mc.setRenderViewEntity(originalViewEntity);
                 mc.gameSettings.hideGUI = originalHideGUI;
@@ -271,7 +266,6 @@ public class BlockCamera extends Block {
             mc.player.sendMessage(new TextComponentString("Failed to take screenshot: " + e.getMessage()));
             e.printStackTrace();
         } finally {
-            // Ensure main FB is bound (we already deleted our custom FB or tried to)
             try {
                 mc.getFramebuffer().bindFramebuffer(true);
             } catch (Throwable ignored) {}
