@@ -1,31 +1,39 @@
 package com.h1ggsk.minewatch.blocks;
 
+import it.unimi.dsi.fastutil.longs.Long2ObjectMap;
 import net.minecraft.block.Block;
 import net.minecraft.block.material.Material;
 import net.minecraft.block.properties.PropertyDirection;
 import net.minecraft.block.state.BlockStateContainer;
 import net.minecraft.block.state.IBlockState;
 import net.minecraft.client.Minecraft;
+import net.minecraft.client.multiplayer.ChunkProviderClient;
 import net.minecraft.client.shader.Framebuffer;
 import net.minecraft.entity.Entity;
 import net.minecraft.entity.EntityLivingBase;
 import net.minecraft.entity.player.EntityPlayer;
 import net.minecraft.util.*;
 import net.minecraft.util.math.BlockPos;
+import net.minecraft.util.math.ChunkPos;
 import net.minecraft.util.text.TextComponentString;
 import net.minecraft.world.World;
+import net.minecraft.world.chunk.Chunk;
 import net.minecraftforge.client.event.EntityViewRenderEvent;
 import net.minecraftforge.fml.common.Mod;
 import net.minecraftforge.fml.common.eventhandler.SubscribeEvent;
 import net.minecraftforge.fml.common.gameevent.TickEvent;
+import net.minecraftforge.fml.relauncher.Side;
+import net.minecraftforge.fml.relauncher.SideOnly;
 import org.lwjgl.BufferUtils;
 import org.lwjgl.opengl.GL11;
-import org.lwjgl.opengl.GL12;
 
 import javax.imageio.ImageIO;
 import java.awt.image.BufferedImage;
 import java.io.File;
+import java.lang.reflect.Field;
 import java.nio.IntBuffer;
+import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
@@ -37,20 +45,37 @@ public class BlockCamera extends Block {
     private static EnumFacing cameraFacing;
     private static float cameraYaw = 0f;
     private static float cameraPitch = 0f;
-    private static ClientViewPlayer cameraView = null;
+    private static CameraEntity cameraView = null;
+
+    // Track all camera blocks and their update timers
+    private static final Map<BlockPos, Integer> cameraTimers = new ConcurrentHashMap<>();
+    private static final Map<BlockPos, IBlockState> cameraStates = new ConcurrentHashMap<>();
+    private static final int CAPTURE_INTERVAL = 5; // 5 ticks = 4 times/second
 
     // Executor for background saving
-    private static final ExecutorService saveExecutor = Executors.newSingleThreadExecutor(r -> {
+    private static final ExecutorService saveExecutor = Executors.newFixedThreadPool(2, r -> {
         Thread t = new Thread(r, "camera-screenshot-saver");
         t.setDaemon(true);
         return t;
     });
 
-    // Resolution scale for screenshots: 1.0 = full size, 0.5 = half size, etc.
-    // Lower this to reduce main-thread time for glReadPixels and to reduce memory/encoding time.
-    private static final double RESOLUTION_SCALE = 1.0; // change to 0.5 or 0.33 for quicker captures
-    // THIS IS BROKEN, IT SCALES DOWN TO A PART OF YOUR SCREEN BASED ON THE LOWER LEFT CORNER POSITION
-    // IE RESOLUTION_SCALE = 0.5 IS THE BOTTOM LEFT QUARTER OF THE SCREEN
+    // Base directory for saving images
+    private static final File WEB_DIR = new File("C:/xampp/htdocs/minewatch");
+
+    // Resolution scale for screenshots
+    private static final double RESOLUTION_SCALE = 1.0; // Reduced for performance
+
+    // Reflection field for accessing loaded chunks
+    private static Field loadedChunksField = null;
+
+    static {
+        try {
+            loadedChunksField = ChunkProviderClient.class.getDeclaredField("loadedChunks");
+            loadedChunksField.setAccessible(true);
+        } catch (NoSuchFieldException e) {
+            e.printStackTrace();
+        }
+    }
 
     public BlockCamera() {
         super(Material.IRON);
@@ -72,29 +97,135 @@ public class BlockCamera extends Block {
     }
 
     @Override
+    public void onBlockAdded(World world, BlockPos pos, IBlockState state) {
+        if (!world.isRemote) return;
+        cameraTimers.put(pos, 0);
+        cameraStates.put(pos, state);
+    }
+
+    @Override
+    public void breakBlock(World world, BlockPos pos, IBlockState state) {
+        if (!world.isRemote) return;
+        cameraTimers.remove(pos);
+        cameraStates.remove(pos);
+        super.breakBlock(world, pos, state);
+    }
+
+    @Override
     public boolean onBlockActivated(World world, BlockPos pos, IBlockState state,
                                     EntityPlayer player, EnumHand hand, EnumFacing side,
                                     float hitX, float hitY, float hitZ) {
         if (world.isRemote) {
-            // Schedule screenshot for next tick
-            screenshotScheduled = true;
-            cameraPos = pos;
-            cameraFacing = state.getValue(FACING);
-
-            // Calculate camera rotation based on facing
-            calculateCameraRotation();
+            // Manual capture
+            scheduleScreenshot(pos, state.getValue(FACING));
         }
         return true;
+    }
+
+    private static void scheduleScreenshot(BlockPos pos, EnumFacing facing) {
+        screenshotScheduled = true;
+        cameraPos = pos;
+        cameraFacing = facing;
+        calculateCameraRotation();
+    }
+
+    private static Long2ObjectMap<Chunk> getLoadedChunks(World world) {
+        if (world.isRemote && world.getChunkProvider() instanceof ChunkProviderClient) {
+            ChunkProviderClient chunkProvider = (ChunkProviderClient) world.getChunkProvider();
+            try {
+                return (Long2ObjectMap<Chunk>) loadedChunksField.get(chunkProvider);
+            } catch (Exception e) {
+                e.printStackTrace();
+            }
+        }
+        return null;
+    }
+
+    private static List<Chunk> getLoadedChunksList(World world) {
+        List<Chunk> loadedChunks = new ArrayList<>();
+        Long2ObjectMap<Chunk> map = getLoadedChunks(world);
+
+        if (map != null) {
+            for (Chunk chunk : map.values()) {
+                if (chunk != null && chunk.isLoaded()) {
+                    loadedChunks.add(chunk);
+                }
+            }
+        }
+
+        return loadedChunks;
+    }
+
+    @SubscribeEvent
+    public static void onClientTick(TickEvent.ClientTickEvent event) {
+        if (event.phase != TickEvent.Phase.END) return;
+
+        Minecraft mc = Minecraft.getMinecraft();
+        World world = mc.world;
+
+        if (world == null) return;
+
+        // Scan for camera blocks in loaded chunks on client side
+        if (world.getTotalWorldTime() % 20 == 0) { // Check every second to reduce load
+            for (Chunk chunk : getLoadedChunksList(world)) {
+                ChunkPos chunkPos = chunk.getPos();
+
+                // Scan all block positions in the chunk for camera blocks
+                for (int x = 0; x < 16; x++) {
+                    for (int y = 0; y < world.getHeight(); y++) {
+                        for (int z = 0; z < 16; z++) {
+                            BlockPos pos = new BlockPos(chunkPos.x * 16 + x, y, chunkPos.z * 16 + z);
+                            IBlockState state = chunk.getBlockState(x, y, z);
+
+                            if (state.getBlock() instanceof BlockCamera) {
+                                cameraTimers.putIfAbsent(pos, 0);
+                                cameraStates.put(pos, state);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Update timers and schedule captures for all known cameras
+        for (Iterator<Map.Entry<BlockPos, Integer>> it = cameraTimers.entrySet().iterator(); it.hasNext();) {
+            Map.Entry<BlockPos, Integer> entry = it.next();
+            BlockPos pos = entry.getKey();
+            int timer = entry.getValue() + 1;
+
+            // Check if chunk is loaded and block still exists
+            if (!world.isBlockLoaded(pos) || !(world.getBlockState(pos).getBlock() instanceof BlockCamera)) {
+                it.remove();
+                cameraStates.remove(pos);
+                continue;
+            }
+
+            if (timer >= CAPTURE_INTERVAL) {
+                IBlockState state = cameraStates.get(pos);
+                if (state != null) {
+                    scheduleScreenshot(pos, state.getValue(FACING));
+                }
+                timer = 0;
+            }
+
+            entry.setValue(timer);
+        }
+
+        // Process scheduled screenshot
+        if (screenshotScheduled) {
+            screenshotScheduled = false;
+            takeScreenshotFromCameraPosition();
+        }
     }
 
     private static void calculateCameraRotation() {
         switch (cameraFacing) {
             case NORTH:
-                cameraYaw = 0f;  // Changed from 180f to 0f
+                cameraYaw = 0f;
                 cameraPitch = 0f;
                 break;
             case SOUTH:
-                cameraYaw = 180f;  // Changed from 0f to 180f
+                cameraYaw = 180f;
                 cameraPitch = 0f;
                 break;
             case WEST:
@@ -106,11 +237,11 @@ public class BlockCamera extends Block {
                 cameraPitch = 0f;
                 break;
             case UP:
-                cameraYaw = 0f;  // Fixed - don't use player yaw
+                cameraYaw = 0f;
                 cameraPitch = -90f;
                 break;
             case DOWN:
-                cameraYaw = 0f;  // Fixed - don't use player yaw
+                cameraYaw = 0f;
                 cameraPitch = 90f;
                 break;
         }
@@ -126,14 +257,6 @@ public class BlockCamera extends Block {
         }
     }
 
-    @SubscribeEvent
-    public static void onClientTick(TickEvent.ClientTickEvent event) {
-        if (event.phase == TickEvent.Phase.END && screenshotScheduled) {
-            screenshotScheduled = false;
-            takeScreenshotFromCameraPosition();
-        }
-    }
-
     private static void takeScreenshotFromCameraPosition() {
         Minecraft mc = Minecraft.getMinecraft();
 
@@ -144,7 +267,7 @@ public class BlockCamera extends Block {
 
         try {
             // Create a temporary camera entity
-            cameraView = new ClientViewPlayer(mc.world);
+            cameraView = new CameraEntity(mc.world);
 
             // Calculate camera position - center of the block
             double camX = cameraPos.getX() + 0.5;
@@ -211,10 +334,17 @@ public class BlockCamera extends Block {
             final int w = width;
             final int h = height;
             final int[] pixelsToSave = pixels;
-            final File ssdir = new File(mc.gameDir, "screenshots");
-            if (!ssdir.exists()) ssdir.mkdirs();
-            final String filename = "camera_" + System.currentTimeMillis() + ".png";
-            final File outFile = new File(ssdir, filename);
+            final String filename = System.currentTimeMillis() + ".png";
+
+            // Generate folder structure based on camera position and facing
+            final String folderPath = String.format("x%d_y%d_z%d_%s",
+                    cameraPos.getX(), cameraPos.getY(), cameraPos.getZ(),
+                    cameraFacing.getName().toLowerCase());
+            final File cameraDir = new File(WEB_DIR, folderPath);
+            if (!cameraDir.exists()) cameraDir.mkdirs();
+
+            final File outFile = new File(cameraDir, "latest.png");
+            final File timestampedFile = new File(cameraDir, filename);
 
             saveExecutor.submit(() -> {
                 try {
@@ -238,10 +368,12 @@ public class BlockCamera extends Block {
                     BufferedImage image = new BufferedImage(w, h, BufferedImage.TYPE_INT_ARGB);
                     image.setRGB(0, 0, w, h, flipped, 0, w);
                     ImageIO.write(image, "png", outFile);
+                    ImageIO.write(image, "png", timestampedFile);
 
                     // Notify player
                     Minecraft.getMinecraft().addScheduledTask(() ->
-                            Minecraft.getMinecraft().player.sendMessage(new TextComponentString("Saved security camera screenshot: " + filename))
+                            Minecraft.getMinecraft().player.sendMessage(
+                                    new TextComponentString("Camera saved: " + folderPath + "/" + filename))
                     );
                 } catch (Exception e) {
                     Minecraft.getMinecraft().addScheduledTask(() ->

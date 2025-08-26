@@ -6,9 +6,9 @@ import net.minecraft.world.World;
 
 import java.util.UUID;
 
-public class ClientViewPlayer extends AbstractClientPlayer {
+public class CameraEntity extends AbstractClientPlayer {
 
-	public ClientViewPlayer(World world) {
+	public CameraEntity(World world) {
 		super(world, new GameProfile(UUID.fromString("41C82C87-7AfB-4024-BA57-13D2C99CAE77"), "[Minecraft]"));
 	}
 
